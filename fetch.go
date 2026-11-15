@@ -86,6 +86,28 @@ type Fetcher struct {
 	// duration.
 	AutoClose bool
 
+	// MaxRetries is the maximum number of retries, in addition to the initial
+	// request, for each eligible command that receives a 429 or 503 response.
+	// If zero or negative, retries are disabled and the Fetcher keeps its
+	// original behavior. Configuration must be set before Start; changing it
+	// while the Fetcher is running is not supported.
+	MaxRetries int
+
+	// RetryDelay is the initial wait time before the first retry of a command
+	// that received a 429 or 503 response. On consecutive such responses the
+	// wait doubles, up to MaxRetryDelay. It is only used when MaxRetries is
+	// greater than 0; if zero or negative at Start, it defaults to
+	// DefaultRetryDelay.
+	RetryDelay time.Duration
+
+	// MaxRetryDelay is the upper limit of the wait time computed by the
+	// retry rules, including wait times derived from a Retry-After header.
+	// It does not limit the per-host request interval (CrawlDelay or the
+	// robots.txt crawl delay). It is only used when MaxRetries is greater
+	// than 0; if zero or negative at Start, it defaults to
+	// DefaultMaxRetryDelay.
+	MaxRetryDelay time.Duration
+
 	// q holds the Queue to send data to the fetcher and optionally close (stop) it.
 	q *Queue
 	// dbg is a channel used to push debug information.
@@ -107,12 +129,14 @@ type DebugInfo struct {
 // New returns an initialized Fetcher.
 func New(h Handler) *Fetcher {
 	return &Fetcher{
-		Handler:       h,
-		CrawlDelay:    DefaultCrawlDelay,
-		HttpClient:    http.DefaultClient,
-		UserAgent:     DefaultUserAgent,
-		WorkerIdleTTL: DefaultWorkerIdleTTL,
-		dbg:           make(chan *DebugInfo, 1),
+		Handler:        h,
+		CrawlDelay:     DefaultCrawlDelay,
+		HttpClient:     http.DefaultClient,
+		UserAgent:      DefaultUserAgent,
+		WorkerIdleTTL:  DefaultWorkerIdleTTL,
+		RetryDelay:     DefaultRetryDelay,
+		MaxRetryDelay:  DefaultMaxRetryDelay,
+		dbg:            make(chan *DebugInfo, 1),
 	}
 }
 
@@ -235,6 +259,18 @@ func (q *Queue) sendWithMethod(method string, rawurl []string) (int, error) {
 
 // Start starts the Fetcher, and returns the Queue to use to send Commands to be fetched.
 func (f *Fetcher) Start() *Queue {
+	// Normalize the retry configuration. Retries remain opt-in via
+	// MaxRetries > 0; only when enabled do the delay fields get their
+	// defaults applied.
+	if f.MaxRetries > 0 {
+		if f.RetryDelay <= 0 {
+			f.RetryDelay = DefaultRetryDelay
+		}
+		if f.MaxRetryDelay <= 0 {
+			f.MaxRetryDelay = DefaultMaxRetryDelay
+		}
+	}
+
 	f.hosts = make(map[string]chan Command)
 
 	f.q = &Queue{
@@ -391,14 +427,30 @@ loop:
 				wait = time.After(delay)
 
 			case agent == nil || agent.Test(v.URL().Path):
-				// Path allowed, process the request
-				res, err := f.doRequest(v)
-				f.visit(v, res, err)
-				// No delay on error - the remote host was not reached
-				if err == nil {
-					wait = time.After(delay)
-				} else {
+				// Path allowed, process the request. Eligible commands
+				// are retried internally on 429/503 responses.
+				res, err, postWait, aborted := f.fetch(v, delay)
+				if !aborted {
+					f.visit(v, res, err)
+				}
+				// Schedule the next request to this host. A network error
+				// imposes no crawl delay - the remote host was not reached.
+				// A retry-derived wait still applies when the last response
+				// was a 429/503, even if the command exhausted its retries.
+				// Both waits started when the last request completed, so they
+				// run concurrently and the larger one subsumes the other.
+				// MaxRetryDelay never limits the crawl delay.
+				switch {
+				case aborted:
 					wait = nil
+				case err != nil:
+					wait = nil
+				default:
+					d := delay
+					if postWait > d {
+						d = postWait
+					}
+					wait = time.After(d)
 				}
 
 			default:

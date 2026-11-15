@@ -55,6 +55,30 @@ commands have been handled.
 
 A more complex and complete example can be found in the repository, at /example/full/.
 
+Retries
+
+The Fetcher can automatically retry eligible commands whose responses have a
+429 or 503 status code. The feature is opt-in via the MaxRetries field, which
+counts retries in addition to the initial request independently per command;
+a zero or negative MaxRetries (the default) preserves the original behavior.
+RetryDelay is the initial wait before the first retry (default 1s) and doubles
+on consecutive 429/503 responses, capped at MaxRetryDelay (default 30s). When
+retries are enabled, a non-positive RetryDelay or MaxRetryDelay at Start time
+is replaced by its default. Only user-enqueued GET or HEAD commands without a
+request body (no ReaderProvider or ValuesProvider) are retried; other methods,
+commands with a body, the internal robots.txt request and network errors are
+not. A valid Retry-After header (non-negative decimal seconds or an HTTP date
+accepted by http.ParseTime, whitespace trimmed, past dates meaning zero wait)
+replaces the exponential wait for that attempt, while invalid values fall back
+to it and oversized values are capped at MaxRetryDelay. Intermediate responses
+never reach the Handler and their bodies are closed before the wait; a single
+final response or error is dispatched once. Retries run inside the host worker,
+so same-host ordering is preserved and other hosts are not blocked, and the
+retry wait runs concurrently with the host's crawl interval rather than being
+added to it. Queue.Close waits for retries, Queue.Cancel interrupts retry
+waits, and restarting a Fetcher does not carry retry state over. A runnable
+demo is available in /example/retry/.
+
 Fetcher
 
 Basically, a Fetcher is an instance of a web crawler, independent of other Fetchers.
@@ -145,6 +169,11 @@ long-running crawlers.
 reach 0.
 
 * DisablePoliteness : If true, ignores the robots.txt policies of the hosts.
+
+* MaxRetries, RetryDelay, MaxRetryDelay : Control automatic retries of
+eligible GET/HEAD commands that receive a 429 or 503 response. See the
+Retries section above for the full semantics. Retries are disabled when
+MaxRetries is zero or negative.
 
 What fetchbot doesn't do - especially compared to gocrawl - is that it doesn't
 keep track of already visited URLs, and it doesn't normalize the URLs. This is outside

@@ -19,6 +19,7 @@ The [API documentation is available on godoc.org](http://godoc.org/github.com/Pu
 
 ## Changes
 
+* Unreleased: add per-command automatic retries on `429` and `503` responses, configured via the new `MaxRetries`, `RetryDelay` and `MaxRetryDelay` Fetcher fields, with `Retry-After` header support (see [Retries](#retries)).
 * 2019-09-11 (v1.2.0): update robotstxt dependency (import path/repo URL has changed, issue #31, thanks to [@michael-stevens][michael-stevens] for raising the issue).
 * 2017-09-04 (v1.1.1): fix a goroutine leak when cancelling a Queue (issue #26, thanks to [@ryu-koui][ryu] for raising the issue).
 * 2017-07-06 (v1.1.0): add `Queue.Done` to get the done channel on the queue, allowing to wait in a `select` statement (thanks to [@DennisDenuto][denuto]).
@@ -61,6 +62,79 @@ func handler(ctx *fetchbot.Context, res *http.Response, err error) {
 ```
 
 A more complex and complete example can be found in the repository, at /example/full/.
+
+### Retries
+
+Some hosts briefly return `429 Too Many Requests` or `503 Service Unavailable`
+under load. Instead of letting the business callback re-enqueue the command
+(which would scramble the per-host request order) and instead of letting one
+rate-limited host stall every other host, the Fetcher can retry the affected
+commands internally. Three fields control this behavior and must be set before
+`Start` (they are not safe to change while the Fetcher is running):
+
+* `MaxRetries`: the maximum number of retries *in addition to* the initial
+request, counted independently for each command. A value of `0` or less (the
+default) keeps the original, non-retrying behavior, so existing code is
+unaffected.
+* `RetryDelay`: the initial wait before the first retry. It defaults to 1
+second. On consecutive `429`/`503` responses the wait doubles (1s, 2s, 4s,
+...) without ever overflowing.
+* `MaxRetryDelay`: the upper limit of a retry wait, including waits derived
+from a `Retry-After` header. It defaults to 30 seconds.
+
+When retries are enabled, a `RetryDelay` or `MaxRetryDelay` that is zero or
+negative at `Start` time is replaced by its default. `MaxRetryDelay` only
+caps the retry rules; it never limits the host request interval
+(`CrawlDelay` or the robots.txt crawl delay).
+
+Only user-enqueued `GET` or `HEAD` commands that provide no request body
+(neither `ReaderProvider` nor `ValuesProvider`) are retried. Other HTTP
+methods, commands with a body, the internal robots.txt request and network
+errors are never retried. Intermediate `429`/`503` responses never reach the
+`Handler`: their bodies are closed before the wait, and a single final
+response or error is dispatched exactly once through the usual command-
+specific or global Handler rules. Retries reuse the original command, so
+custom headers, basic authentication and cookies are preserved, and the
+retry is never implemented by re-sending the command to the public Queue.
+
+If the response carries a `Retry-After` header, a valid value replaces the
+exponential wait for that attempt: a non-negative decimal integer is
+interpreted as seconds and an HTTP date (in any format accepted by
+`http.ParseTime`) as an absolute time, with dates in the past meaning zero
+wait. Leading and trailing whitespace is ignored, invalid values fall back
+to the exponential wait, and oversized values are capped at
+`MaxRetryDelay`.
+
+Retries run inside the host's dedicated worker, so later commands for the
+same host cannot overtake a command that is still retrying, while other
+hosts keep processing independently. Before the next same-host request -
+including a retry - both the retry wait and the host request interval must
+have elapsed; both start when the previous request completes, so they run
+concurrently and the larger one subsumes the other rather than being added.
+Even when a command has exhausted its retries, the wait computed from its
+last `429`/`503` still delays subsequent commands on that host. When the
+Queue has no more work, it does not stay open just to fully elapse that
+wait.
+
+`Queue.Close` waits for accepted commands and their retries to finish.
+`Queue.Cancel` interrupts retry waits promptly, starts no new retry and
+dispatches no callback for commands that have not completed; in-flight HTTP
+requests and running callbacks finish as before. Commands waiting between
+retries are not lost to `WorkerIdleTTL` expiry or `AutoClose`, and
+restarting a Fetcher never inherits the previous Queue's retry state.
+
+A runnable, fully offline demo that starts a local server returning
+`429`/`503` before `200` lives in /example/retry/.
+
+```go
+f := fetchbot.New(fetchbot.HandlerFunc(handler))
+f.MaxRetries = 3
+f.RetryDelay = 500 * time.Millisecond
+f.MaxRetryDelay = 30 * time.Second
+queue := f.Start()
+queue.SendStringGet("https://example.com/rate-limited")
+queue.Close()
+```
 
 ### Fetcher
 
@@ -154,6 +228,11 @@ long-running crawlers.
 reach 0.
 
 * DisablePoliteness : If true, ignores the robots.txt policies of the hosts.
+
+* MaxRetries, RetryDelay, MaxRetryDelay : Control automatic retries of
+eligible GET/HEAD commands that receive a 429 or 503 response. See the
+[Retries](#retries) section for the full semantics. Retries are disabled
+when MaxRetries is zero or negative (the default).
 
 What fetchbot doesn't do - especially compared to gocrawl - is that it doesn't
 keep track of already visited URLs, and it doesn't normalize the URLs. This is outside
